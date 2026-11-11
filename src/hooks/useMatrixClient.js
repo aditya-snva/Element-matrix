@@ -2,13 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ClientEvent, RoomEvent, MatrixEventEvent, MsgType, HttpApiEvent,
   passwordLogin, buildClient, initCrypto, loadSavedSession, clearSavedSession, wipeDeviceStores,
-  forgetDevice, lockDevice, unlockDevice,
+  forgetDevice, lockDevice, unlockDevice, saveSession,
   describeError, classifyEvent, logDecryptionFailure,
 } from "../services/matrixClient.js";
+import { getChannel, broadcast, askPeersForSession } from "../services/tabSync.js";
 
 export function useMatrixClient() {
   const clientRef = useRef(null);
-  const [phase, setPhase] = useState("idle"); // idle | logging-in | crypto | syncing | ready | error
+  // starting | idle | logging-in | crypto | syncing | ready | error
+  // | elsewhere (another tab runs this session) | taking-over
+  const [phase, setPhase] = useState("starting");
   const [status, setStatus] = useState("Not connected");
   const [syncState, setSyncState] = useState(null);
   const [cryptoStatus, setCryptoStatus] = useState("not initialised");
@@ -42,6 +45,7 @@ export function useMatrixClient() {
   const endSession = useCallback(async (client, { reason = null, serverLogout = false } = {}) => {
     if (!client || clientRef.current !== client) return;
     const deviceId = client.getDeviceId();
+    broadcast({ type: "logout", deviceId, reason }); // other tabs sharing this session must drop it too
     forgetDevice(deviceId);
     stop({ release: false }); // keep the device lock until its store is deleted
     clearSavedSession();
@@ -58,23 +62,27 @@ export function useMatrixClient() {
   /** `fresh` = straight after a password login (vs. resuming the tab's saved session). */
   const startWithSession = useCallback(async (s, { fresh = false } = {}) => {
     stop();
+    setSession({ baseUrl: s.baseUrl, userId: s.userId, deviceId: s.deviceId });
     if (!(await lockDevice(s.deviceId))) {
-      // Typically a duplicated tab: it copied sessionStorage, but the original tab is
-      // using this device's crypto store. Sharing it would corrupt the store.
-      clearSavedSession();
-      setPhase("error"); setStatus("Not connected");
-      setLoginError("This session is already open in another tab. Use that tab, or log in here to get a separate session.");
+      // Another tab is running this device. Two clients on one device would fight over
+      // room keys and presence, so this tab waits until the user clicks Continue.
+      setPhase("elsewhere"); setStatus("Open in another window"); setLoginError(null);
       return;
     }
-    setSession({ baseUrl: s.baseUrl, userId: s.userId, deviceId: s.deviceId });
     const client = buildClient(s);
     clientRef.current = client;
 
     setPhase("crypto"); setStatus("Initialising end-to-end encryption…"); setCryptoStatus("initialising");
     try {
       await initCrypto(client, s.deviceId);
+      if (clientRef.current !== client) {
+        // Another tab took over while crypto was starting: close the store we just opened.
+        client.stopClient();
+        return;
+      }
       setCryptoStatus("ready (Rust crypto)");
     } catch (err) {
+      if (clientRef.current !== client) return;
       const text = describeError(err, "crypto");
       const reason = "Crypto initialisation failed — login is NOT complete. " + text;
       pushError("Crypto init: " + text);
@@ -150,11 +158,56 @@ export function useMatrixClient() {
     await endSession(c, { serverLogout: true });
   }, [endSession]);
 
-  // Resume an existing session in this tab (keeps the same device + crypto store).
-  useEffect(() => {
+  /** "Continue": move the shared session from the other tab to this one. */
+  const takeOver = useCallback(async () => {
     const s = loadSavedSession();
-    if (s) startWithSession(s);
-    return () => stop();
+    if (!s) { setPhase("idle"); setSession(null); return; }
+    setPhase("taking-over"); setStatus("Disconnecting the other window…"); setLoginError(null);
+    broadcast({ type: "takeover", deviceId: s.deviceId });
+    // The other tab stops its client and releases the device lock; wait for it.
+    if (!(await lockDevice(s.deviceId, { waitMs: 10000 }))) {
+      setPhase("elsewhere"); setStatus("Open in another window");
+      setLoginError("The other window did not release the session. Close it, then click Continue again.");
+      return;
+    }
+    await startWithSession(s);
+  }, [startWithSession]);
+
+  useEffect(() => {
+    let alive = true;
+    const ch = getChannel();
+    const onMessage = (e) => {
+      const msg = e.data || {};
+      if (msg.type === "hello") {
+        // A new tab wants the shared session (the CRM frontend would get it from the backend).
+        const s = loadSavedSession();
+        if (s) ch.postMessage({ type: "session", session: s });
+      } else if (msg.type === "takeover") {
+        if (clientRef.current?.getDeviceId() !== msg.deviceId) return;
+        stop(); // stops sync + crypto and releases the device lock for the other tab
+        setPhase("elsewhere"); setStatus("Open in another window"); setSyncState(null);
+        setCryptoStatus("not initialised"); setLoginError(null);
+      } else if (msg.type === "logout") {
+        if (loadSavedSession()?.deviceId !== msg.deviceId) return;
+        stop(); clearSavedSession();
+        setSession(null); setPhase("idle"); setStatus("Not connected"); setSyncState(null);
+        setCryptoStatus("not initialised"); setLoginError(msg.reason || "You were logged out in another window.");
+      }
+    };
+    ch?.addEventListener("message", onMessage);
+
+    // Resume this tab's session (reload), or pick up the one another tab is using.
+    (async () => {
+      let s = loadSavedSession();
+      if (!s) {
+        s = await askPeersForSession();
+        if (s && alive) saveSession(s);
+      }
+      if (!alive) return;
+      if (s) startWithSession(s); else setPhase("idle");
+    })();
+
+    return () => { alive = false; ch?.removeEventListener("message", onMessage); stop(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -187,6 +240,6 @@ export function useMatrixClient() {
 
   return {
     client: clientRef.current, phase, status, syncState, cryptoStatus, session,
-    loginError, errors, version, login, logout, sendText, loadOlder, pushError, classifyEvent, refresh: bump,
+    loginError, errors, version, login, logout, takeOver, sendText, loadOlder, pushError, classifyEvent, refresh: bump,
   };
 }

@@ -71,11 +71,16 @@ export function forgetDevice(deviceId) {
 // A Web Lock is held for as long as this tab uses the device (released on stop or tab close).
 const heldLocks = new Map(); // deviceId -> release()
 
-export async function lockDevice(deviceId) {
+/**
+ * Take this tab's lock on a device. By default fails at once if another tab holds it;
+ * with `waitMs` it waits up to that long for the other tab to release it (takeover).
+ */
+export async function lockDevice(deviceId, { waitMs = 0 } = {}) {
   if (heldLocks.has(deviceId)) return true;
   if (!navigator.locks) return true; // very old browser: no way to check
+  const opts = waitMs > 0 ? { signal: AbortSignal.timeout(waitMs) } : { ifAvailable: true };
   return new Promise((resolve) => {
-    navigator.locks.request(`mct-device-${deviceId}`, { ifAvailable: true }, (lock) => {
+    navigator.locks.request(`mct-device-${deviceId}`, opts, (lock) => {
       if (!lock) { resolve(false); return undefined; }
       resolve(true);
       return new Promise((release) => heldLocks.set(deviceId, release));
@@ -154,8 +159,13 @@ export async function passwordLogin(homeserver, username, password) {
     deviceId: res.device_id,
     accessToken: res.access_token,
   };
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  saveSession(session);
   return session;
+}
+
+/** Keep the session for this tab only (sessionStorage is cleared when the tab closes). */
+export function saveSession(session) {
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
 }
 
 export function loadSavedSession() {

@@ -3,6 +3,7 @@ import LoginForm from "./components/LoginForm.jsx";
 import RoomList from "./components/RoomList.jsx";
 import ChatWindow from "./components/ChatWindow.jsx";
 import DebugPanel from "./components/DebugPanel.jsx";
+import OpenElsewhere from "./components/OpenElsewhere.jsx";
 import { useMatrixClient } from "./hooks/useMatrixClient.js";
 
 export default function App() {
@@ -35,7 +36,11 @@ export default function App() {
         </div>
       </header>
 
-      {!loggedIn ? (
+      {m.phase === "starting" ? (
+        <div className="login-wrap"><div className="muted"><span className="spinner" /> Loading…</div></div>
+      ) : m.phase === "elsewhere" || m.phase === "taking-over" ? (
+        <OpenElsewhere onContinue={m.takeOver} busy={m.phase === "taking-over"} error={m.loginError} />
+      ) : !loggedIn ? (
         <LoginForm onLogin={m.login} phase={m.phase} status={m.status} error={m.loginError} />
       ) : (
         <main className="main">
