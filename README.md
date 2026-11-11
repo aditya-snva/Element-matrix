@@ -20,7 +20,9 @@ Manual alternative: `npm install` then `npm run dev`.
 - Decryption failures are logged in the console with room ID, sender, session ID and failure code only.
 
 ## Session and secrets
-The access token lives only in `sessionStorage` (cleared when the tab closes), so a reload keeps the same device and crypto store. The password is never stored. Crypto keys are in IndexedDB, one store per device (`mct-<deviceId>`). Diagnostics never include passwords, tokens, recovery keys or room keys. The Recovery Key text is cleared when a restore starts; its decoded bytes are retained only for that restore and then wiped. The SDK stores the recovered **message-backup key** and imported room keys in its IndexedDB crypto store.
+The access token lives only in `sessionStorage` (cleared when the tab closes), so a reload keeps the same device and crypto store. The password is never stored. Crypto keys are in IndexedDB, one store per device (`mct-<deviceId>`). Logging out, or the server revoking the token (`M_UNKNOWN_TOKEN`), stops the client, returns to the login screen and deletes that device's store.
+
+Device reuse: the device ID (not a secret) is remembered in `localStorage` per homeserver + username, and the next login reuses that device and its crypto store instead of creating a new session in Element. A Web Lock ensures only one tab uses a device at a time; a second tab gets its own device. If the device was deleted on the server meanwhile, the tester discards it and creates a fresh one. If crypto setup fails on a fresh login, the new device is logged out on the server again. Diagnostics never include passwords, tokens, recovery keys or room keys. The Recovery Key text is cleared when a restore starts; its decoded bytes are retained only for that restore and then wiped. The SDK stores the recovered **message-backup key** and imported room keys in its IndexedDB crypto store.
 
 ## WebAssembly
 `vite.config.js` excludes `@matrix-org/matrix-sdk-crypto-wasm` from pre-bundling and forces `Content-Type: application/wasm` for `.wasm` files. If you host the built `dist/` elsewhere, that server must also serve `.wasm` as `application/wasm`.

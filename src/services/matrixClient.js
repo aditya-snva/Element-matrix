@@ -7,7 +7,10 @@ export const DEFAULT_HOMESERVER =
 
 const SESSION_KEY = "mct.session"; // sessionStorage only: cleared when the tab closes
 
-export const { ClientEvent, RoomEvent, MatrixEventEvent, EventType, MsgType } = sdk;
+export const { ClientEvent, RoomEvent, MatrixEventEvent, EventType, MsgType, HttpApiEvent } = sdk;
+
+/** IndexedDB prefix for this device's Rust crypto store. */
+export const cryptoPrefixFor = (deviceId) => `mct-${deviceId}`;
 
 export function normalizeHomeserver(url) {
   let u = (url || "").trim();
@@ -41,16 +44,110 @@ function identifierFor(username) {
   return { type: "m.id.user", user: u };
 }
 
+// ---- Device reuse -------------------------------------------------------------
+// Each /login normally creates a NEW device, so every closed tab used to leave an
+// unverified session behind in Element. We remember the device ID (not a secret)
+// per homeserver + username and log in to that same device next time, reusing its
+// crypto store. The access token itself still lives only in sessionStorage.
+const DEVICES_KEY = "mct.devices";
+
+const slotFor = (baseUrl, username) => `${baseUrl}|${username.trim().toLowerCase()}`;
+
+function readDevices() {
+  try { return JSON.parse(localStorage.getItem(DEVICES_KEY) || "{}") || {}; } catch { return {}; }
+}
+function writeDevices(map) {
+  try { localStorage.setItem(DEVICES_KEY, JSON.stringify(map)); } catch { /* storage unavailable */ }
+}
+
+/** Stop reusing this device (it was logged out, revoked, or its store is gone). */
+export function forgetDevice(deviceId) {
+  const map = readDevices();
+  for (const [slot, d] of Object.entries(map)) if (d?.deviceId === deviceId) delete map[slot];
+  writeDevices(map);
+}
+
+// One tab per device: two tabs must never open the same crypto store at once.
+// A Web Lock is held for as long as this tab uses the device (released on stop or tab close).
+const heldLocks = new Map(); // deviceId -> release()
+
+export async function lockDevice(deviceId) {
+  if (heldLocks.has(deviceId)) return true;
+  if (!navigator.locks) return true; // very old browser: no way to check
+  return new Promise((resolve) => {
+    navigator.locks.request(`mct-device-${deviceId}`, { ifAvailable: true }, (lock) => {
+      if (!lock) { resolve(false); return undefined; }
+      resolve(true);
+      return new Promise((release) => heldLocks.set(deviceId, release));
+    }).catch(() => resolve(false));
+  });
+}
+
+export function unlockDevice(deviceId) {
+  heldLocks.get(deviceId)?.();
+  heldLocks.delete(deviceId);
+}
+
+/** True if the login landed on the remembered device AND the server still has its keys. */
+async function reusedDeviceIsIntact(baseUrl, res, reuse) {
+  if (res.user_id !== reuse.userId || res.device_id !== reuse.deviceId) return false;
+  try {
+    const temp = sdk.createClient({ baseUrl, accessToken: res.access_token, userId: res.user_id });
+    const keys = await temp.downloadKeysForUsers([res.user_id]);
+    return !!keys.device_keys?.[res.user_id]?.[res.device_id];
+  } catch {
+    return true; // can't tell (network): keep the device rather than throw it away
+  }
+}
+
+/** Delete a device's crypto store without a running client (an unstarted client can clear stores). */
+async function wipeStoreById(baseUrl, deviceId) {
+  await wipeDeviceStores(sdk.createClient({ baseUrl }), deviceId);
+}
+
+async function revokeToken(baseUrl, accessToken) {
+  try { await sdk.createClient({ baseUrl, accessToken }).logout(); } catch { /* best effort */ }
+}
+
 export async function passwordLogin(homeserver, username, password) {
   const baseUrl = normalizeHomeserver(homeserver);
-  const temp = sdk.createClient({ baseUrl });
-  const res = await temp.loginRequest({
-    type: "m.login.password",
-    identifier: identifierFor(username),
-    password,
-    initial_device_display_name: "Matrix Chat Tester (web)",
-  });
-  temp.stopClient();
+  const slot = slotFor(baseUrl, username);
+  const remembered = readDevices()[slot];
+  // Reuse the previous device only if no other tab is currently using it.
+  const reuse = remembered?.deviceId && (await lockDevice(remembered.deviceId)) ? remembered : null;
+
+  const request = (deviceId) => {
+    const temp = sdk.createClient({ baseUrl });
+    return temp.loginRequest({
+      type: "m.login.password",
+      identifier: identifierFor(username),
+      password,
+      initial_device_display_name: "Matrix Chat Tester (web)",
+      ...(deviceId ? { device_id: deviceId } : {}),
+    });
+  };
+
+  let res;
+  try {
+    res = await request(reuse?.deviceId);
+    if (reuse && !(await reusedDeviceIsIntact(baseUrl, res, reuse))) {
+      // Either a different account (never attach another account's crypto store), or the
+      // device was deleted (e.g. from Element) while this tab was closed: the server then
+      // dropped its keys and the old store would not upload them again. Discard it and
+      // start a clean device instead.
+      await revokeToken(baseUrl, res.access_token);
+      if (res.user_id === reuse.userId) await wipeStoreById(baseUrl, reuse.deviceId);
+      forgetDevice(reuse.deviceId);
+      unlockDevice(reuse.deviceId);
+      res = await request(null);
+    }
+  } catch (err) {
+    if (reuse) unlockDevice(reuse.deviceId);
+    throw err;
+  }
+  if (reuse && res.device_id !== reuse.deviceId) unlockDevice(reuse.deviceId);
+
+  writeDevices({ ...readDevices(), [slot]: { userId: res.user_id, deviceId: res.device_id } });
   const session = {
     baseUrl: res.well_known?.["m.homeserver"]?.base_url?.replace(/\/+$/, "") || baseUrl,
     userId: res.user_id,
@@ -89,10 +186,24 @@ export function buildClient(session) {
 /** Must run BEFORE startClient(). Uses IndexedDB, one store per device. */
 export async function initCrypto(client, deviceId) {
   if (typeof WebAssembly === "undefined") throw new Error("This browser does not support WebAssembly.");
-  await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: `mct-${deviceId}` });
+  await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoPrefixFor(deviceId) });
   const crypto = client.getCrypto();
   if (!crypto) throw new Error("initRustCrypto() completed but getCrypto() returned nothing.");
   return crypto;
+}
+
+/**
+ * Delete this device's crypto store from IndexedDB. Call only once the device is
+ * finished (logged out / token revoked): its keys can never be used again.
+ * The client must already be stopped (stopClient() closes the crypto DB).
+ */
+export async function wipeDeviceStores(client, deviceId) {
+  if (!client || !deviceId) return;
+  try {
+    await client.clearStores({ cryptoDatabasePrefix: cryptoPrefixFor(deviceId) });
+  } catch (err) {
+    console.warn("[MCT] Could not delete crypto store", cryptoPrefixFor(deviceId), err?.message);
+  }
 }
 
 /** Unlock Element secret storage, then restore the existing server message backup. */
